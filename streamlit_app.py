@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime
 import time
+import hashlib
 
 # Page config
 st.set_page_config(
@@ -33,6 +34,13 @@ st.markdown("""
     .success { background-color: #d4edda; color: #155724; }
     .processing { background-color: #fff3cd; color: #856404; }
     .failed { background-color: #f8d7da; color: #721c24; }
+    .history-item {
+        background-color: #f8f9fa;
+        padding: 10px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        border-left: 4px solid #007bff;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,11 +49,23 @@ if 'api_token' not in st.session_state:
     st.session_state.api_token = None
 if 'job_history' not in st.session_state:
     st.session_state.job_history = []
+if 'global_history' not in st.session_state:
+    st.session_state.global_history = {}  # Persists across logins
+if 'current_user_hash' not in st.session_state:
+    st.session_state.current_user_hash = None
+if 'download_job_id' not in st.session_state:
+    st.session_state.download_job_id = None
+if 'check_job_id' not in st.session_state:
+    st.session_state.check_job_id = None
 
 # API Base URL
 API_BASE_URL = "https://transcribe-staging.api.inflexion.ai/enterprise"
 
 # Helper functions
+def get_user_hash(token):
+    """Create a hash of the API token for user identification"""
+    return hashlib.md5(token.encode()).hexdigest()[:16]
+
 def get_mime_type(filename):
     """Get MIME type based on file extension"""
     ext = filename.split('.')[-1].lower()
@@ -82,7 +102,7 @@ def format_status(status):
     return f'<span class="status-badge {css_class}">{status.upper()}</span>'
 
 def save_job_to_history(job_data):
-    """Save job to session history"""
+    """Save job to both session and persistent history"""
     job_entry = {
         "id": job_data["id"],
         "title": job_data["title"],
@@ -90,9 +110,27 @@ def save_job_to_history(job_data):
         "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": job_data["status"]
     }
+    
+    # Save to session history
     st.session_state.job_history.insert(0, job_entry)
-    # Keep only last 20 jobs
     st.session_state.job_history = st.session_state.job_history[:20]
+    
+    # Save to persistent history
+    if st.session_state.current_user_hash:
+        if st.session_state.current_user_hash not in st.session_state.global_history:
+            st.session_state.global_history[st.session_state.current_user_hash] = []
+        
+        st.session_state.global_history[st.session_state.current_user_hash].insert(0, job_entry)
+        # Keep last 100 jobs per user
+        st.session_state.global_history[st.session_state.current_user_hash] = \
+            st.session_state.global_history[st.session_state.current_user_hash][:100]
+
+def load_user_history():
+    """Load history for current user"""
+    if st.session_state.current_user_hash and \
+       st.session_state.current_user_hash in st.session_state.global_history:
+        st.session_state.job_history = \
+            st.session_state.global_history[st.session_state.current_user_hash].copy()
 
 # Main App
 st.title("🎙️ INFLXD Transcription Service")
@@ -112,6 +150,8 @@ with st.sidebar:
         if st.button("Authenticate", type="primary", use_container_width=True):
             if api_key_input:
                 st.session_state.api_token = api_key_input
+                st.session_state.current_user_hash = get_user_hash(api_key_input)
+                load_user_history()
                 st.success("✓ Authenticated successfully!")
                 st.rerun()
             else:
@@ -122,18 +162,24 @@ with st.sidebar:
         
         if st.button("Logout", use_container_width=True):
             st.session_state.api_token = None
+            st.session_state.current_user_hash = None
+            st.session_state.job_history = []
             st.rerun()
     
     # Recent Jobs History
     if st.session_state.job_history:
         st.divider()
         st.header("📝 Recent Jobs")
-        for job in st.session_state.job_history[:5]:
-            with st.expander(f"{job['title'][:30]}...", expanded=False):
-                st.text(f"ID: {job['id'][:20]}...")
-                st.text(f"Company: {job['company']}")
-                st.text(f"Submitted: {job['submitted_at']}")
-                st.text(f"Status: {job['status']}")
+        st.caption("Click on a job to see details and copy ID")
+        
+        for i, job in enumerate(st.session_state.job_history[:5]):
+            with st.expander(f"🔸 {job['title'][:25]}..." if len(job['title']) > 25 else f"🔸 {job['title']}", expanded=False):
+                st.markdown(f"**Company:** {job['company']}")
+                st.markdown(f"**Status:** {job['status']}")
+                st.markdown(f"**Submitted:** {job['submitted_at']}")
+                st.divider()
+                st.markdown("**📋 Job ID** *(click below to select and copy)*")
+                st.code(job['id'], language=None)
 
 # Check if authenticated
 if st.session_state.api_token is None:
@@ -141,7 +187,7 @@ if st.session_state.api_token is None:
     st.stop()
 
 # Main content area with tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📤 Upload Audio", "📊 Check Status", "📥 Download Transcript", "📚 API Documentation"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload Audio", "📊 Check Status", "📥 Download Transcript", "📜 📚 API Documentation", "Under development..."])
 
 # Tab 1: Upload Audio
 with tab1:
@@ -289,11 +335,19 @@ with tab1:
 with tab2:
     st.header("Check Transcription Status")
     
+    # Use job ID from history if available
+    default_job_id = st.session_state.check_job_id if st.session_state.check_job_id else ""
+    
     job_id = st.text_input(
         "Enter Job ID",
         placeholder="e.g., 508926fa-9729-4dd7-9b1e-9aeecb5c9642",
-        help="Enter the job ID from your transcription submission"
+        help="Enter the job ID from your transcription submission",
+        value=default_job_id
     )
+    
+    # Clear the session state job ID after use
+    if st.session_state.check_job_id:
+        st.session_state.check_job_id = None
     
     col1, col2 = st.columns([3, 1])
     with col2:
@@ -311,11 +365,19 @@ with tab2:
                 if response and response.status_code == 200:
                     status_data = response.json()
                     
-                    # Update status in history
+                    # Update status in both session and persistent history
                     for job in st.session_state.job_history:
                         if job['id'] == job_id:
                             job['status'] = status_data['status']
                             break
+                    
+                    # Update persistent history
+                    if st.session_state.current_user_hash and \
+                       st.session_state.current_user_hash in st.session_state.global_history:
+                        for job in st.session_state.global_history[st.session_state.current_user_hash]:
+                            if job['id'] == job_id:
+                                job['status'] = status_data['status']
+                                break
                     
                     # Display status
                     st.markdown(f"### Status: {format_status(status_data['status'])}", unsafe_allow_html=True)
@@ -361,11 +423,19 @@ with tab3:
     col1, col2 = st.columns(2)
     
     with col1:
+        # Use job ID from history if available
+        default_download_id = st.session_state.download_job_id if st.session_state.download_job_id else ""
+        
         download_job_id = st.text_input(
             "Enter Job ID",
             placeholder="e.g., 508926fa-9729-4dd7-9b1e-9aeecb5c9642",
-            key="download_job_id"
+            key="download_job_id_field",
+            value=default_download_id
         )
+        
+        # Clear the session state job ID after use
+        if st.session_state.download_job_id:
+            st.session_state.download_job_id = None
         
         format_type = st.selectbox(
             "Select Output Format",
